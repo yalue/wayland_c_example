@@ -327,7 +327,6 @@ static int ProcessWaylandEvents(ApplicationState *s, uint8_t *buffer,
         (unsigned) event.opcode, (unsigned) event.object_id);
       return 0;
     }
-    exit(0);
   }
   return 1;
 }
@@ -390,6 +389,7 @@ int main(int argc, char **argv) {
   }
 
   // Run the event loop until exit.
+  printf("Running. Press Ctrl+C to exit.\n");
   result = EventLoop(&state);
   if (!result) {
     printf("The event loop exited with an error.\n");
