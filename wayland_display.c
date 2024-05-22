@@ -13,6 +13,7 @@
 
 #define WAYLAND_DISPLAY_OBJECT_ID (1)
 #define WAYLAND_DISPLAY_GET_REGISTRY_OPCODE (1)
+#define WAYLAND_REGISTRY_BIND_OPCODE (0)
 #define WAYLAND_REGISTRY_GLOBAL_EVENT (0)
 #define WAYLAND_DISPLAY_ERROR_EVENT (0)
 #define IMAGE_WIDTH (256)
@@ -30,6 +31,18 @@ typedef struct {
   int shm_fd;
   // The ID of the display registry used by wayland.
   uint32_t registry_id;
+  // The ID bound to the global wl_shm object.
+  uint32_t shm_id;
+  // The ID bound to the global wl_compositor object.
+  uint32_t compositor_id;
+  // The ID bound to the global xdg_wm_base object.
+  uint32_t xdg_wm_base_id;
+  // The IDs of the wayland surface object and the associated xdg objects.
+  uint32_t surface_id;
+  uint32_t xdg_surface_id;
+  uint32_t xdg_toplevel_id;
+  // Will be nonzero if we're done binding to the global objects we need.
+  int binding_done;
   // Properties of the image we'll display.
   uint32_t width;
   uint32_t height;
@@ -85,21 +98,46 @@ static void SaveDebugFile(int file_id, uint8_t *data, int size) {
 }
 */
 
+// Rounds v up to the next multiple of 4.
+static uint32_t RoundUp4(uint32_t v) {
+  while (v & 3) v++;
+  return v;
+}
+
 static void AppendUint32(uint8_t *buffer, size_t *current_offset, uint32_t v) {
   *((uint32_t *) (buffer + *current_offset)) = v;
   *current_offset += 4;
+}
+
+// Appends the given string, preceded by its length, to the buffer. Prints a
+// message and returns 0 if appending the string would exceed the buffer's
+// capacity.
+static int AppendWaylandString(uint8_t *buffer, size_t *current_offset,
+  size_t buffer_capacity, char *str) {
+  size_t length = strlen(str);
+  size_t padded_length = RoundUp4(length + 1);
+  size_t padding_length = padded_length - length;
+  size_t remaining = buffer_capacity - *current_offset;
+  if ((padded_length + 4) > remaining) {
+    printf("Appending a string exceeds the %u bytes remaining in a buffer.\n",
+      (unsigned) remaining);
+    return 0;
+  }
+  // 1. Append the string length + 1 for null terminator.
+  // 2. Append the string content
+  // 3. Add the null terminator.
+  AppendUint32(buffer, current_offset, length + 1);
+  memcpy(buffer + *current_offset, str, length);
+  *current_offset += length;
+  memset(buffer + *current_offset, 0, padding_length);
+  *current_offset += padding_length;
+  return 1;
 }
 
 static uint32_t ReadUint32(uint8_t *buffer, size_t *current_offset) {
   uint32_t to_return = *((uint32_t *) (buffer + *current_offset));
   *current_offset += 4;
   return to_return;
-}
-
-// Rounds v up to the next multiple of 4.
-static uint32_t RoundUp4(uint32_t v) {
-  while (v & 3) v++;
-  return v;
 }
 
 // Assumes the current offset into the buffer is at the start of a wayland
@@ -226,6 +264,48 @@ static uint32_t GetWaylandDisplayRegistry(ApplicationState *s) {
   return 1;
 }
 
+// Binds the global object with the given numeric "name" to a new ID and
+// returns the ID.
+static uint32_t WaylandRegistryBind(ApplicationState *s, uint32_t name,
+  char *interface, uint32_t version) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[256];
+  uint8_t payload[248];
+  size_t buffer_offset = 0;
+  size_t payload_offset = 0;
+  uint32_t new_id = 0;
+  size_t result;
+  new_id = NextWaylandID();
+
+  // The args:
+  //  1. Numeric name
+  //  2. Interface string (length + content)
+  //  3. Version
+  //  4. The ID to bind the object to
+  // WHY IS THIS NOT WHAT IT SAYS IN WAYLAND.XML???? WHY IS THE "DOCUMENTATION"
+  // APPARENTLY SOME RANDOM BLOG POSTS?
+  AppendUint32(payload, &payload_offset, name);
+  if (!AppendWaylandString(payload, &payload_offset, sizeof(payload),
+    interface)) {
+    printf("Error copying wayland interface name string.\n");
+    return 0;
+  }
+  AppendUint32(payload, &payload_offset, version);
+  AppendUint32(payload, &payload_offset, new_id);
+
+  msg.object_id = s->registry_id;
+  msg.opcode = WAYLAND_REGISTRY_BIND_OPCODE;
+  msg.payload_size = payload_offset;
+  msg.payload = payload;
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending registry bind message: %s\n", strerror(errno));
+    return 0;
+  }
+  return new_id;
+}
+
 // Generates a random path for the shared memory object, opens it, and maps it
 // into the image buffer. Returns 0 on error.
 static int OpenSharedMemoryObject(ApplicationState *s) {
@@ -280,6 +360,91 @@ static void PrintErrorEventInfo(ParsedWaylandEvent *e) {
     (unsigned) error_code, msg);
 }
 
+// Returns 0 if we're still looking for global objects to bind to, otherwise
+// returns 1.
+static int BindingDone(ApplicationState *s) {
+  if (s->binding_done) return 1;
+  if (s->shm_id && s->compositor_id && s->xdg_wm_base_id) {
+    s->binding_done = 1;
+    return 1;
+  }
+  return 0;
+}
+
+// Sets up surface-related state. Sets s->surface_id, s->xdg_surface_id, and
+// s->xdg_toplevel_id. Returns 0 on error, 1 on success.
+static int CreateSurface(ApplicationState *s) {
+  ParsedWaylandEvent msg;
+  // We only need this for 3 small messages.
+  uint8_t buffer[256];
+  uint32_t args[2];
+  size_t buffer_offset = 0;
+  size_t result;
+  memset(buffer, 0, sizeof(buffer));
+  memset(&msg, 0, sizeof(msg));
+
+  // Create a surface with a new ID.
+  s->surface_id = NextWaylandID();
+  msg.payload = (uint8_t *) &(s->surface_id);
+  msg.payload_size = sizeof(uint32_t);
+  msg.object_id = s->compositor_id;
+  // compositor.0 = create surface
+  msg.opcode = 0;
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+
+  // Use the new surface ID to create an xdg surface. This takes 2 args: the
+  // new XDG surface ID and the associated compositor surface.
+  s->xdg_surface_id = NextWaylandID();
+  args[0] = s->xdg_surface_id;
+  args[1] = s->surface_id;
+  msg.payload = (uint8_t *) args;
+  msg.payload_size = sizeof(args);
+  msg.object_id = s->xdg_wm_base_id;
+  // xdg_wm_base.2 = get_xdg_surface
+  msg.opcode = 2;
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+
+  // Use the XDG surface ID to get an XDG toplevel instance.
+  s->xdg_toplevel_id = NextWaylandID();
+  msg.payload = (uint8_t *) &(s->xdg_toplevel_id);
+  msg.payload_size = sizeof(uint32_t);
+  msg.object_id = s->xdg_surface_id;
+  // xdg_surface.1 = get_toplevel
+  msg.opcode = 1;
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+
+  // Send all 3 messages in a single send call.
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending messages to set up wayland surface: %s\n",
+      strerror(errno));
+    return 0;
+  }
+
+  return 1;
+}
+
+// Responds to an xdg "ping" to check that the application is alive.
+static int SendXDGPong(ApplicationState *s, uint32_t ping_serial) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[128];
+  size_t buffer_offset = 0;
+  size_t result;
+  uint32_t arg = ping_serial;
+  msg.object_id = s->xdg_wm_base_id;
+  msg.payload_size = sizeof(uint32_t);
+  msg.payload = (uint8_t *) &arg;
+  // xdg_wm_base.3 = pong
+  msg.opcode = 3;
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending pong to XDG WM: %s\n", strerror(errno));
+    return 0;
+  }
+  return 1;
+}
+
 // Handles a single event received on the wayland socket. Receives the object's
 // ID, opcode, the (non-padded) size of the message payload and the payload
 // itself, which must be ignored if payload_size is 0.
@@ -297,6 +462,36 @@ static int HandleWaylandEvent(ApplicationState *s, ParsedWaylandEvent *e) {
     interface_version = ReadUint32(e->payload, &payload_offset);
     printf("Found interface %s: name %u, version %u\n", interface_name,
       (unsigned) name, (unsigned) interface_version);
+    if (strcmp("wl_shm", interface_name) == 0) {
+      s->shm_id = WaylandRegistryBind(s, name, interface_name,
+        interface_version);
+      if (!s->shm_id) {
+        printf("Error binding wl_shm object.\n");
+        return 0;
+      } else {
+        printf("  -> Bound to ID %u\n", (unsigned) s->shm_id);
+      }
+    }
+    if (strcmp("xdg_wm_base", interface_name) == 0) {
+      s->xdg_wm_base_id = WaylandRegistryBind(s, name, interface_name,
+        interface_version);
+      if (!s->xdg_wm_base_id) {
+        printf("Error binding xdg_wm_base object.\n");
+        return 0;
+      } else {
+        printf("  -> Bound to ID %u\n", (unsigned) s->xdg_wm_base_id);
+      }
+    }
+    if (strcmp("wl_compositor", interface_name) == 0) {
+      s->compositor_id = WaylandRegistryBind(s, name, interface_name,
+        interface_version);
+      if (!s->compositor_id) {
+        printf("Error binding wl_compositor object.\n");
+        return 0;
+      } else {
+        printf("  -> Bound to ID %u\n", (unsigned) s->compositor_id);
+      }
+    }
     return 1;
   }
 
@@ -305,6 +500,22 @@ static int HandleWaylandEvent(ApplicationState *s, ParsedWaylandEvent *e) {
     PrintErrorEventInfo(e);
     return 0;
   }
+
+  // "ping" event from the xdg_wm_base
+  if ((e->object_id == s->xdg_wm_base_id) &&
+    (e->opcode == 4)) {
+    if (e->payload_size != sizeof(uint32_t)) {
+      printf("Incorrect xdg ping payload size: %d\n", (int) e->payload_size);
+      return 0;
+    }
+    return SendXDGPong(s, *((uint32_t *) e->payload));
+  }
+
+  // TODO (next): Reacting to events: configure/ACK configure
+  //  - Need to handle configure events from the xdg_surface
+  //  - See https://gaultier.github.io/blog/wayland_from_scratch.html
+  //  - Should be easier now that I know how to read the XML!
+
   printf("Handling opcode %d on object %u is not supported!\n",
     (int) e->opcode, (unsigned) e->object_id);
   return 0;
@@ -334,6 +545,9 @@ static int ProcessWaylandEvents(ApplicationState *s, uint8_t *buffer,
 // Reads from the socket and handles events until signalled or an error occurs.
 // Returns 0 if an error caused an exit, and 1 otherwise.
 static int EventLoop(ApplicationState *s) {
+  // This really should probably be a ring buffer in case a message is split
+  // between two reads or the buffer overflows, but whatever. The article I
+  // followed ignores this issue for simplicity as well.
   uint8_t recv_buffer[4096];
   memset(recv_buffer, 0, sizeof(recv_buffer));
   ssize_t bytes_read = 0;
@@ -346,6 +560,12 @@ static int EventLoop(ApplicationState *s) {
     if (!ProcessWaylandEvents(s, recv_buffer, bytes_read)) {
       printf("Error handling wayland messages.\n");
       return 0;
+    }
+    if (BindingDone(s) && !s->surface_id) {
+      if (!CreateSurface(s)) {
+        printf("Error creating surface.\n");
+        return 0;
+      }
     }
   }
   return 1;
