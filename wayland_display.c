@@ -16,12 +16,21 @@
 #define WAYLAND_REGISTRY_BIND_OPCODE (0)
 #define WAYLAND_REGISTRY_GLOBAL_EVENT (0)
 #define WAYLAND_DISPLAY_ERROR_EVENT (0)
+#define WAYLAND_SHM_FORMAT_EVENT (0)
+#define XDG_WM_PING_EVENT (0)
+#define XDG_SURFACE_CONFIGURE_EVENT (0)
 #define IMAGE_WIDTH (256)
 #define IMAGE_HEIGHT (256)
 #define COLOR_CHANNELS (4)
 
 // Will be set to nonzero if the application should exit.
 static int should_exit = 0;
+
+typedef enum {
+  NONE = 0,
+  ACKED_CONFIGURE = 1,
+  SURFACE_ATTACHED = 2,
+} SurfaceState;
 
 // Holds various IDs and such we use for the window.
 typedef struct {
@@ -43,6 +52,8 @@ typedef struct {
   uint32_t xdg_toplevel_id;
   // Will be nonzero if we're done binding to the global objects we need.
   int binding_done;
+  // Will be 0 if we ack'd the initial xdg_surface.configure event.
+  SurfaceState surface_state;
   // Properties of the image we'll display.
   uint32_t width;
   uint32_t height;
@@ -328,7 +339,6 @@ static int OpenSharedMemoryObject(ApplicationState *s) {
       (int) s->image_buffer_size, strerror(errno));
     return 0;
   }
-  printf("Mapping %d-byte shared memory file %s (FD %d)\n", (int) s->image_buffer_size, shm_path, s->shm_fd);
   s->image_buffer = mmap(NULL, s->image_buffer_size,
     PROT_READ | PROT_WRITE, MAP_SHARED, s->shm_fd, 0);
   if (s->image_buffer == MAP_FAILED) {
@@ -424,6 +434,16 @@ static int CreateSurface(ApplicationState *s) {
   return 1;
 }
 
+// To be called after a configure is ACKED in order to render a frame. Sets up
+// the shm buffers if they aren't already set up.
+static int RenderFrame(ApplicationState *s) {
+  // TODO (next): Draw a red rectangle!
+  //  - See https://gaultier.github.io/blog/wayland_from_scratch.html
+  //  - Should be easier now that I know how to read the XML!
+  printf("Not yet implemented!!\n");
+  return 0;
+}
+
 // Responds to an xdg "ping" to check that the application is alive.
 static int SendXDGPong(ApplicationState *s, uint32_t ping_serial) {
   ParsedWaylandEvent msg;
@@ -439,7 +459,27 @@ static int SendXDGPong(ApplicationState *s, uint32_t ping_serial) {
   WriteWaylandMessage(buffer, &buffer_offset, &msg);
   result = send(s->socket_fd, buffer, buffer_offset, 0);
   if (result != buffer_offset) {
-    printf("Error sending pong to XDG WM: %s\n", strerror(errno));
+    printf("Error sending XDG WM pong: %s\n", strerror(errno));
+    return 0;
+  }
+  return 1;
+}
+
+// Responds to xdg_surface "configure" events. Similar to SendXDGPong.
+static int AckXDGSurfaceConfigure(ApplicationState *s, uint32_t serial) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[64];
+  size_t result, buffer_offset = 0;
+  uint32_t arg = serial;
+  msg.object_id = s->xdg_surface_id;
+  msg.payload_size = sizeof(uint32_t);
+  msg.payload = (uint8_t *) &arg;
+  // xdg_surface.4 = ack_configure
+  msg.opcode = 4;
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending xdg_surface.ack_configure: %s\n", strerror(errno));
     return 0;
   }
   return 1;
@@ -451,6 +491,7 @@ static int SendXDGPong(ApplicationState *s, uint32_t ping_serial) {
 static int HandleWaylandEvent(ApplicationState *s, ParsedWaylandEvent *e) {
   size_t payload_offset = 0;
   uint32_t name, interface_version = 0;
+  int result;
   char *interface_name = NULL;
 
   // The global registry can produce two events: announcing an object is
@@ -503,7 +544,7 @@ static int HandleWaylandEvent(ApplicationState *s, ParsedWaylandEvent *e) {
 
   // "ping" event from the xdg_wm_base
   if ((e->object_id == s->xdg_wm_base_id) &&
-    (e->opcode == 4)) {
+    (e->opcode == XDG_WM_PING_EVENT)) {
     if (e->payload_size != sizeof(uint32_t)) {
       printf("Incorrect xdg ping payload size: %d\n", (int) e->payload_size);
       return 0;
@@ -511,10 +552,31 @@ static int HandleWaylandEvent(ApplicationState *s, ParsedWaylandEvent *e) {
     return SendXDGPong(s, *((uint32_t *) e->payload));
   }
 
-  // TODO (next): Reacting to events: configure/ACK configure
-  //  - Need to handle configure events from the xdg_surface
-  //  - See https://gaultier.github.io/blog/wayland_from_scratch.html
-  //  - Should be easier now that I know how to read the XML!
+  // The surface configure message from xdg_surface must be ack'd
+  if ((e->object_id == s->xdg_surface_id) &&
+    (e->opcode == XDG_SURFACE_CONFIGURE_EVENT)) {
+    if (e->payload_size != sizeof(uint32_t)) {
+      printf("Incorrect xdg_surface configure payload size: %d\n",
+        (int) e->payload_size);
+      return 0;
+    }
+    result = AckXDGSurfaceConfigure(s, *((uint32_t *) e->payload));
+    if (result == 0) return 0;
+    s->surface_state = ACKED_CONFIGURE;
+    return 1;
+  }
+
+  // These are informational messages about supported pixel formats.
+  if ((e->object_id == s->shm_id) &&
+    (e->opcode == WAYLAND_SHM_FORMAT_EVENT)) {
+    if (e->payload_size != sizeof(uint32_t)) {
+      printf("Incorrect wl_shm.format payload size: %d\n",
+        (int) e->payload_size);
+      return 0;
+    }
+    printf("Supported pixel format: 0x%08x\n", *((uint32_t *) e->payload));
+    return 1;
+  }
 
   printf("Handling opcode %d on object %u is not supported!\n",
     (int) e->opcode, (unsigned) e->object_id);
@@ -564,6 +626,12 @@ static int EventLoop(ApplicationState *s) {
     if (BindingDone(s) && !s->surface_id) {
       if (!CreateSurface(s)) {
         printf("Error creating surface.\n");
+        return 0;
+      }
+    }
+    if (s->surface_state == ACKED_CONFIGURE) {
+      if (!RenderFrame(s)) {
+        printf("Error rendering a frame.\n");
         return 0;
       }
     }
