@@ -10,6 +10,7 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include "hex_dump.h"
 
 #define WAYLAND_DISPLAY_OBJECT_ID (1)
 #define WAYLAND_DISPLAY_GET_REGISTRY_OPCODE (1)
@@ -19,6 +20,7 @@
 #define WAYLAND_SHM_FORMAT_EVENT (0)
 #define XDG_WM_PING_EVENT (0)
 #define XDG_SURFACE_CONFIGURE_EVENT (0)
+#define XDG_TOPLEVEL_CONFIGURE_EVENT (0)
 #define IMAGE_WIDTH (256)
 #define IMAGE_HEIGHT (256)
 #define COLOR_CHANNELS (4)
@@ -42,6 +44,10 @@ typedef struct {
   uint32_t registry_id;
   // The ID bound to the global wl_shm object.
   uint32_t shm_id;
+  // The ID of the shm_pool object.
+  uint32_t shm_pool_id;
+  // The ID of the frame buffer within the shm pool.
+  uint32_t frame_buffer_id;
   // The ID bound to the global wl_compositor object.
   uint32_t compositor_id;
   // The ID bound to the global xdg_wm_base object.
@@ -90,24 +96,6 @@ static void CleanupState(ApplicationState *s) {
   s->socket_fd = -1;
   s->shm_fd = -1;
 }
-
-/*
-static void SaveDebugFile(int file_id, uint8_t *data, int size) {
-  char filename[256];
-  snprintf(filename, sizeof(filename) - 1, "debug_dump_%d.bin", file_id);
-  printf("Saving %d bytes to %s\n", size, filename);
-  FILE *f = fopen(filename, "wb");
-  if (!f) {
-    printf("Error opening debug file %s: %s\n", filename, strerror(errno));
-    return;
-  }
-  if (fwrite(data, size, 1, f) != 1) {
-    printf("Failed writing %d bytes to %s: %s\n", size, filename,
-      strerror(errno));
-  }
-  fclose(f);
-}
-*/
 
 // Rounds v up to the next multiple of 4.
 static uint32_t RoundUp4(uint32_t v) {
@@ -381,29 +369,32 @@ static int BindingDone(ApplicationState *s) {
   return 0;
 }
 
-// Sets up surface-related state. Sets s->surface_id, s->xdg_surface_id, and
-// s->xdg_toplevel_id. Returns 0 on error, 1 on success.
-static int CreateSurface(ApplicationState *s) {
+// Creates and sets s->surface_id.
+static int CreateWLSurface(ApplicationState *s) {
   ParsedWaylandEvent msg;
-  // We only need this for 3 small messages.
-  uint8_t buffer[256];
-  uint32_t args[2];
-  size_t buffer_offset = 0;
-  size_t result;
-  memset(buffer, 0, sizeof(buffer));
-  memset(&msg, 0, sizeof(msg));
-
-  // Create a surface with a new ID.
+  uint8_t buffer[64];
+  size_t result, buffer_offset = 0;
   s->surface_id = NextWaylandID();
   msg.payload = (uint8_t *) &(s->surface_id);
   msg.payload_size = sizeof(uint32_t);
   msg.object_id = s->compositor_id;
-  // compositor.0 = create surface
   msg.opcode = 0;
   WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending create-surface message: %s\n", strerror(errno));
+    return 0;
+  }
+  printf("s->surface_id = %d\n", (int) s->surface_id);
+  return 1;
+}
 
-  // Use the new surface ID to create an xdg surface. This takes 2 args: the
-  // new XDG surface ID and the associated compositor surface.
+// Creates and sets s->xdg_surface_id. Must be called after CreateWLSurface.
+static int CreateXDGSurface(ApplicationState *s) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[64];
+  size_t result, buffer_offset = 0;
+  uint32_t args[2];
   s->xdg_surface_id = NextWaylandID();
   args[0] = s->xdg_surface_id;
   args[1] = s->surface_id;
@@ -413,8 +404,20 @@ static int CreateSurface(ApplicationState *s) {
   // xdg_wm_base.2 = get_xdg_surface
   msg.opcode = 2;
   WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error getting xdg surface: %s\n", strerror(errno));
+    return 0;
+  }
+  printf("s->xdg_surface_id = %d\n", (int) s->xdg_surface_id);
+  return 1;
+}
 
-  // Use the XDG surface ID to get an XDG toplevel instance.
+// Creates and sets s->xdg_toplevel_id. Must be called after CreateXDGSurface.
+static int GetXDGTopLevel(ApplicationState *s) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[64];
+  size_t result, buffer_offset = 0;
   s->xdg_toplevel_id = NextWaylandID();
   msg.payload = (uint8_t *) &(s->xdg_toplevel_id);
   msg.payload_size = sizeof(uint32_t);
@@ -422,26 +425,213 @@ static int CreateSurface(ApplicationState *s) {
   // xdg_surface.1 = get_toplevel
   msg.opcode = 1;
   WriteWaylandMessage(buffer, &buffer_offset, &msg);
-
-  // Send all 3 messages in a single send call.
   result = send(s->socket_fd, buffer, buffer_offset, 0);
   if (result != buffer_offset) {
-    printf("Error sending messages to set up wayland surface: %s\n",
-      strerror(errno));
+    printf("Error getting xdg toplevel: %s\n", strerror(errno));
     return 0;
   }
+  printf("s->xdg_toplevel_id = %d\n", (int) s->xdg_toplevel_id);
+  return 1;
+}
 
+static int CreateSurface(ApplicationState *s) {
+  if (!CreateWLSurface(s)) return 0;
+  if (!CreateXDGSurface(s)) return 0;
+  if (!GetXDGTopLevel(s)) return 0;
+  return 1;
+}
+
+// Wraps the sendmsg call to include the shm_fd descriptor as ancillary data.
+static int SendMsgWithShmDescriptor(ApplicationState *s, uint8_t *msg_buffer,
+  size_t msg_size) {
+  uint8_t control_buffer[CMSG_SPACE(sizeof(int))];
+  struct iovec io;
+  struct msghdr message_info;
+  struct cmsghdr *control_info = NULL;
+  ssize_t result;
+  memset(&message_info, 0, sizeof(message_info));
+  memset(control_buffer, 0, sizeof(control_buffer));
+  memset(&io, 0, sizeof(io));
+
+  // Set up the entry to send the "normal" message content.
+  io.iov_base = msg_buffer;
+  io.iov_len = msg_size;
+  message_info.msg_iov = &io;
+  message_info.msg_iovlen = 1;
+
+  // Set up the control data to send the FD.
+  message_info.msg_control = control_buffer;
+  message_info.msg_controllen = sizeof(control_buffer);
+  control_info = CMSG_FIRSTHDR(&message_info);
+  control_info->cmsg_level = SOL_SOCKET;
+  control_info->cmsg_type = SCM_RIGHTS;
+  control_info->cmsg_len = CMSG_LEN(sizeof(int));
+  *((int *) CMSG_DATA(control_info)) = s->shm_fd;
+
+  printf("Message sent when creating shm pool:\n");
+  PrintHexDump((uint8_t *) io.iov_base, io.iov_len, 0);
+
+  // Actually send the FD and message data.
+  result = sendmsg(s->socket_fd, &message_info, 0);
+  if (result < 0) {
+    printf("Error sending message with FD: %s\n", strerror(errno));
+    return 0;
+  }
+  return 1;
+}
+
+// Sends the message to create the shm_pool object. Requires a bunch of socket
+// boilderplate to send the shm_fd, so this gets a separate function.
+static int CreateShmPool(ApplicationState *s) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[256];
+  size_t buffer_offset = 0;
+  uint32_t args[2];
+  uint32_t shm_pool_id = NextWaylandID();
+  // wayland.xml includes the FD in the args, but the blog post code does not.
+  // This version seems to work on my systems.
+  args[0] = shm_pool_id;
+  args[1] = s->image_buffer_size;
+  // wl_shm.create_pool = opcode 0
+  msg.object_id = s->shm_id;
+  msg.opcode = 0;
+  msg.payload = (uint8_t *) args;
+  msg.payload_size = sizeof(args);
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  if (!SendMsgWithShmDescriptor(s, buffer, buffer_offset)) {
+    printf("Error sending shm_pool.create message.\n");
+    return 0;
+  }
+  s->shm_pool_id = shm_pool_id;
+  return 1;
+}
+
+// Calls the create_buffer method to set up the shared memory pool as a frame
+// buffer.
+static int CreateFrameBuffer(ApplicationState *s) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[256];
+  size_t buffer_offset = 0;
+  size_t result;
+  uint32_t args[6];
+  uint32_t buffer_id = NextWaylandID();
+
+  // See wayland.xml for the args order.
+  args[0] = buffer_id;
+  args[1] = 0;  // offset in shm buffer
+  args[2] = s->width;
+  args[3] = s->height;
+  args[4] = s->stride;
+  args[5] = 0;  // argb8888
+
+  // shm_pool.create_buffer = opcode 0
+  msg.object_id = s->shm_pool_id;
+  msg.opcode = 0;
+  msg.payload = (uint8_t *) args;
+  msg.payload_size = sizeof(args);
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending create-buffer message: %s\n", strerror(errno));
+    return 0;
+  }
+  s->frame_buffer_id = buffer_id;
+  return 1;
+}
+
+// To be used after creating the frame buffer. Attaches the frame buffer to the
+// wl_surface.
+static int AttachBuffer(ApplicationState *s) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[128];
+  size_t buffer_offset = 0;
+  size_t result;
+  uint32_t args[3];
+
+  // Frame buffer, x, y
+  args[0] = s->frame_buffer_id;
+  args[1] = 0;
+  args[2] = 0;
+
+  // surface.attach = opcode 1
+  msg.object_id = s->surface_id;
+  msg.opcode = 1;
+  msg.payload = (uint8_t *) args;
+  msg.payload_size = sizeof(args);
+
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending surface attach message: %s\n", strerror(errno));
+    return 0;
+  }
+  return 1;
+}
+
+// Signals that the surface is ready to display.
+static int CommitSurface(ApplicationState *s) {
+  ParsedWaylandEvent msg;
+  uint8_t buffer[64];
+  size_t buffer_offset = 0;
+  size_t result;
+  msg.object_id = s->surface_id;
+  msg.opcode = 6;
+  msg.payload_size = 0;
+  msg.payload = NULL;
+  WriteWaylandMessage(buffer, &buffer_offset, &msg);
+  result = send(s->socket_fd, buffer, buffer_offset, 0);
+  if (result != buffer_offset) {
+    printf("Error sending surface commit message: %s\n", strerror(errno));
+    return 0;
+  }
   return 1;
 }
 
 // To be called after a configure is ACKED in order to render a frame. Sets up
 // the shm buffers if they aren't already set up.
 static int RenderFrame(ApplicationState *s) {
-  // TODO (next): Draw a red rectangle!
-  //  - See https://gaultier.github.io/blog/wayland_from_scratch.html
-  //  - Should be easier now that I know how to read the XML!
-  printf("Not yet implemented!!\n");
-  return 0;
+  uint32_t x, y, row_offset, pixel_offset;
+  if (s->shm_pool_id == 0) {
+    if (!CreateShmPool(s)) {
+      printf("Error creating shm_pool.\n");
+      return 0;
+    }
+  }
+  if (s->frame_buffer_id == 0) {
+    if (!CreateFrameBuffer(s)) {
+      printf("Error creating frame buffer.\n");
+      return 0;
+    }
+  }
+
+  // Fill the image buffer with opaque red.
+  memset(s->image_buffer, 0, s->image_buffer_size);
+  row_offset = 0;
+  for (y = 0; y < s->height; y++) {
+    for (x = 0; x < s->width; x++) {
+      pixel_offset = row_offset + (x * 4);
+      // Blue
+      s->image_buffer[pixel_offset] = 0xaa;
+      // Green
+      s->image_buffer[pixel_offset + 1] = 0x10;
+      // Red
+      s->image_buffer[pixel_offset + 2] = 0x55;
+      // Alpha
+      s->image_buffer[pixel_offset + 3] = 0xff;
+    }
+    row_offset += s->stride;
+  }
+
+  if (!AttachBuffer(s)) {
+    printf("Error attaching buffer to surface.\n");
+    return 0;
+  }
+  if (!CommitSurface(s)) {
+    printf("Error committing surface.\n");
+    return 0;
+  }
+  s->surface_state = SURFACE_ATTACHED;
+  return 1;
 }
 
 // Responds to an xdg "ping" to check that the application is alive.
@@ -566,6 +756,20 @@ static int HandleWaylandEvent(ApplicationState *s, ParsedWaylandEvent *e) {
     return 1;
   }
 
+  // The configure message from xdg_toplevel must also be handled. The current
+  // version in xdg-shell.xml says that this requires an ack, but the blog post
+  // version never sends an ack...
+  if ((e->object_id == s->xdg_toplevel_id) &&
+    (e->opcode == XDG_TOPLEVEL_CONFIGURE_EVENT)) {
+    if (e->payload_size < 8) {
+      printf("Invalid payload size for xdg_toplevel configure: %d\n",
+        (int) e->payload_size);
+    }
+    printf("Got xdg toplevel configure event. W=%d, H=%d\n",
+      *((int *) e->payload), *((int *) (e->payload + 4)));
+    return 1;
+  }
+
   // These are informational messages about supported pixel formats.
   if ((e->object_id == s->shm_id) &&
     (e->opcode == WAYLAND_SHM_FORMAT_EVENT)) {
@@ -628,6 +832,11 @@ static int EventLoop(ApplicationState *s) {
         printf("Error creating surface.\n");
         return 0;
       }
+      if (!CommitSurface(s)) {
+        printf("Error initially committing surface.\n");
+        return 0;
+      }
+      printf("Created surface.\n");
     }
     if (s->surface_state == ACKED_CONFIGURE) {
       if (!RenderFrame(s)) {
